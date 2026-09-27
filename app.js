@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.3.1';
+  const APP_VERSION = '1.3.2';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -253,10 +253,12 @@
     return txt(i - 4, i) + '▍' + txt(i, i + 16);
   }
 
-  // 大跳躍（往回超過 4 字、往前超過 30 字）要連續兩次結果都指向同一處才採用，
-  // 避免辨識途中的暫時結果被改寫時，位置來回亂跳
-  let pendingJump = null;
+  // 大跳躍要連續多次結果都指向同一處才採用，避免暫時結果被改寫、
+  // 或換連線後只剩很短的片段時，對到稿子裡其他重複的詞而亂跳。
+  // 往回跳在實際使用中很少見（只有重念時），所以要求更嚴格
+  let pendingJump = null; // { pos, n }
   const JUMP_BACK = 4, JUMP_AHEAD = 30, JUMP_AGREE = 8;
+  const CONFIRM_AHEAD = 2, CONFIRM_BACK = 3;
 
   // 回傳追蹤結果的說明文字（寫進事件紀錄）
   function onSpeech(q) {
@@ -265,10 +267,14 @@
     const d = r.pos - cursor;
     if (d < 0 && d >= -JUMP_BACK) return '小幅倒退，忽略';      // 視為抖動
     if (d < -JUMP_BACK || d > JUMP_AHEAD) {
-      if (!pendingJump || Math.abs(pendingJump - r.pos) > JUMP_AGREE) {
-        pendingJump = r.pos;
-        return `可能跳到第 ${r.pos} 字，等下一次確認`;
+      if (pendingJump && Math.abs(pendingJump.pos - r.pos) <= JUMP_AGREE) {
+        pendingJump.pos = r.pos;
+        pendingJump.n++;
+      } else {
+        pendingJump = { pos: r.pos, n: 1 };
       }
+      const need = d < 0 ? CONFIRM_BACK : CONFIRM_AHEAD;
+      if (pendingJump.n < need) return `可能跳到第 ${r.pos} 字，等確認（${pendingJump.n}/${need}）`;
     }
     pendingJump = null;
     const from = cursor;
@@ -287,17 +293,23 @@
   //  2. 看門狗：完全沒有任何事件太久 → 換新連線（音量偵測不可用時的備援）
   //  3. 換連線時等舊的真正關閉再開新的，避免兩條連線互搶麥克風
   //  4. 每次都建立全新的辨識實例；快速失敗時逐步拉長重試間隔
+  //  5. 例行換線：實測 Chrome 單條連線在「持續說話」約 22 秒後就會卡住，
+  //     所以連線超過 14 秒就趁換氣的空檔用 stop() 換線，最晚 19 秒一定換。
+  //     stop() 會讓 Chrome 先交出剛才聽到的完整結果，不會丟字
   let recGen = 0;          // 每條連線的編號，舊連線的事件一律忽略
   let lastRecEvent = 0;    // 最後一次收到任何辨識事件的時間
   let lastResult = 0;      // 最後一次收到辨識結果的時間
   let sessionStart = 0;
   let restartDelay = 150;
-  let restartT, watchdogT;
+  let restartT, watchdogT, rotateT;
   let everStarted = false; // 這次播放中是否成功開始過
+  let rotating = 0;        // 正在例行換線的連線編號
+  let interimTokens = [];  // 目前還沒成為完整結果的暫時內容（換線時保留下來當上下文）
 
-  const WATCHDOG_MS = 8000;     // 超過這麼久沒有任何事件 → 視為卡住
-  const STALL_SPEECH_MS = 2500; // 偵測到說話這麼久、卻沒有任何辨識結果 → 視為卡住
-  const MAX_SESSION_MS = 45000; // 單條連線用太久 → 趁句子結束時換新的
+  const WATCHDOG_MS = 8000;      // 超過這麼久沒有任何事件 → 視為卡住
+  const STALL_SPEECH_MS = 2500;  // 偵測到說話這麼久、卻沒有任何辨識結果 → 視為卡住
+  const ROTATE_AFTER_MS = 14000; // 連線超過這麼久 → 找停頓的空檔換線
+  const ROTATE_FORCE_MS = 19000; // 連線超過這麼久 → 不等停頓，直接換線
   const MAX_BACKOFF_MS = 2000;
 
   // ---------- 事件紀錄（寫進問題回報；網址加上 ?debug 會在右上角即時顯示） ----------
@@ -392,7 +404,8 @@
       }
       const gotFinal = !!finalText;
       if (heardFinal.length > 80) heardFinal = heardFinal.slice(-QLEN * 2);
-      const q = heardFinal.concat(Tracker.tokenize(interim)).slice(-QLEN);
+      interimTokens = Tracker.tokenize(interim);
+      const q = heardFinal.concat(interimTokens).slice(-QLEN);
       heardEl.textContent = (heardText + interim).slice(-60) || '…';
       setStatus('hearing');
       clearTimeout(hearT);
@@ -407,8 +420,8 @@
         // 對不上時附上稿子目前位置的前後片段，才看得出是辨識錯還是稿子寫法不同
         dbg(`#${gen} 聽到「${shown}」→ ${outcome}` + (lost ? `｜稿子此處「${scriptAround(cursor)}」` : ''));
       }
-      // 連線太久，瀏覽器內部累積的結果會越來越多，趁一句話剛結束時換新連線
-      if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle('連線超過 45 秒');
+      // 一句話剛說完是換線的好時機
+      if (gotFinal && !interim && performance.now() - sessionStart > ROTATE_AFTER_MS) rotate('句子結束');
     };
 
     r.onerror = e => {
@@ -446,10 +459,14 @@
 
     r.onend = () => {
       if (!alive()) return;
-      // 連線很快就結束 → 可能在出錯，拉長重試間隔；正常結束 → 馬上重啟
+      keepInterim();
       const lived = performance.now() - sessionStart;
-      restartDelay = lived < 1500 ? Math.min(restartDelay * 2, MAX_BACKOFF_MS) : 150;
-      dbg(`#${gen} 結束（${(lived / 1000).toFixed(1)}s），${restartDelay}ms 後重啟`);
+      const wasRotating = rotating === gen;
+      rotating = 0;
+      clearTimeout(rotateT);
+      // 例行換線 → 立刻開新的；連線很快就結束 → 可能在出錯，拉長重試間隔；其他 → 馬上重啟
+      restartDelay = wasRotating ? 0 : lived < 1500 ? Math.min(restartDelay * 2, MAX_BACKOFF_MS) : 150;
+      dbg(`#${gen} 結束（${(lived / 1000).toFixed(1)}s${wasRotating ? '，例行換線' : ''}），${restartDelay}ms 後重啟`);
       scheduleRestart();
     };
 
@@ -474,12 +491,38 @@
     }, restartDelay);
   }
 
+  // 連線被丟掉時，還沒變成完整結果的內容會跟著消失；
+  // 把它留下來當比對的上下文，新連線才不會只靠很短的片段去對稿子
+  function keepInterim() {
+    if (!interimTokens.length) return;
+    heardFinal.push(...interimTokens);
+    interimTokens = [];
+  }
+
+  // 例行換線：用 stop() 讓 Chrome 先交出剛才聽到的完整結果，自然結束後由 onend 開新連線
+  function rotate(why) {
+    if (!rec || rotating) return;
+    const gen = recGen;
+    rotating = gen;
+    Report.count('例行換線');
+    dbg(`#${gen} 例行換線（已連 ${((performance.now() - sessionStart) / 1000).toFixed(1)} 秒，${why}）`);
+    try { rec.stop(); }
+    catch { rotating = 0; return recycle('stop() 失敗'); }
+    clearTimeout(rotateT);
+    rotateT = setTimeout(() => {
+      if (rotating === gen && recGen === gen) recycle('stop() 後沒有結束');
+    }, 1500);
+  }
+
   // 丟掉目前的連線，等它真正關閉後再開一條新的（最多等 1 秒）
-  // 正常的例行換連線；其他原因（卡住）記成警告
-  const ROUTINE_RECYCLE = ['連線超過 45 秒', '切回分頁'];
+  // 切回分頁是正常情況；其他原因（卡住）記成警告
+  const ROUTINE_RECYCLE = ['切回分頁'];
   function recycle(reason) {
     Report.count('換新連線：' + reason);
     dbg('換新連線：' + reason, ROUTINE_RECYCLE.includes(reason) ? 'info' : 'warn');
+    keepInterim();
+    rotating = 0;
+    clearTimeout(rotateT);
     const old = rec;
     recGen++;           // 讓舊連線之後的事件全部失效
     rec = null;
@@ -494,18 +537,28 @@
   }
 
   const TICK_MS = 250;
+  let silentTicks = 0;
   function watchdogTick() {
     if (!listening || document.hidden || !rec) return;
     const now = performance.now();
+    const speaking = isSpeaking();
+    silentTicks = speaking ? 0 : silentTicks + 1;
+    if (rotating) return; // 例行換線中，等它結束
+
     // 聽到你在說話，辨識卻沒有回應 → 卡住了
-    if (isSpeaking()) {
+    if (speaking) {
       speakingMs += TICK_MS;
       if (speakingMs >= STALL_SPEECH_MS && now - lastResult > STALL_SPEECH_MS && now - sessionStart > 1500) {
         speakingMs = 0;
         return recycle('有說話但辨識沒回應');
       }
     }
-    if (now - lastRecEvent > WATCHDOG_MS) recycle('太久沒有任何事件');
+    if (now - lastRecEvent > WATCHDOG_MS) return recycle('太久沒有任何事件');
+
+    // 例行換線：連兩次取樣都安靜（約 0.25～0.5 秒的換氣空檔）就換，最晚時間到一定換
+    const age = now - sessionStart;
+    if (age > ROTATE_AFTER_MS && vad && silentTicks >= 2) rotate('趁停頓');
+    else if (age > ROTATE_FORCE_MS) rotate('時間到');
   }
 
   function startListening() {
@@ -517,6 +570,7 @@
     lastProgress = performance.now();
     heardFinal = [];
     heardText = '';
+    interimTokens = [];
     setStatus('listening', '啟動中…');
     dbg(`開始聆聽（語言 ${recogLang()}，音量偵測${VAD_OK ? '開啟' : '在手機上停用'}）`);
     createRec();
@@ -530,7 +584,10 @@
     if (listening) dbg('停止聆聽');
     listening = false;
     recGen++;
+    rotating = 0;
+    interimTokens = [];
     clearTimeout(restartT);
+    clearTimeout(rotateT);
     clearInterval(watchdogT);
     if (rec) { try { rec.abort(); } catch {} rec = null; }
     stopVAD();
