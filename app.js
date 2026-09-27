@@ -250,18 +250,84 @@
     lastProgress = performance.now();
   }
 
-  // Chrome 的連續辨識會不定時自己斷線，偶爾還會卡住（不回結果也不觸發 onend）。
-  // 所以：每次重啟都建立全新的辨識實例、快速失敗時逐步拉長重試間隔、
-  // 並用看門狗偵測「卡住」，自動換一條新連線。
+  // Chrome 的連續辨識會不定時自己斷線，說話說到一半還會「靜默卡住」（不回結果、不報錯、不觸發 onend）。
+  // 對策：
+  //  1. 自己監聽麥克風音量：聽到你在說話、辨識卻一直沒回應 → 約 2.5 秒內換新連線
+  //  2. 看門狗：完全沒有任何事件太久 → 換新連線（音量偵測不可用時的備援）
+  //  3. 換連線時等舊的真正關閉再開新的，避免兩條連線互搶麥克風
+  //  4. 每次都建立全新的辨識實例；快速失敗時逐步拉長重試間隔
   let recGen = 0;          // 每條連線的編號，舊連線的事件一律忽略
   let lastRecEvent = 0;    // 最後一次收到任何辨識事件的時間
+  let lastResult = 0;      // 最後一次收到辨識結果的時間
   let sessionStart = 0;
-  let restartDelay = 250;
+  let restartDelay = 150;
   let restartT, watchdogT;
   let everStarted = false; // 這次播放中是否成功開始過
 
-  const WATCHDOG_MS = 12000;   // 超過這麼久沒有任何事件 → 視為卡住
+  const WATCHDOG_MS = 8000;     // 超過這麼久沒有任何事件 → 視為卡住
+  const STALL_SPEECH_MS = 2500; // 偵測到說話這麼久、卻沒有任何辨識結果 → 視為卡住
   const MAX_SESSION_MS = 45000; // 單條連線用太久 → 趁句子結束時換新的
+  const MAX_BACKOFF_MS = 2000;
+
+  // ---------- 除錯紀錄（網址加上 ?debug 顯示） ----------
+  const DEBUG = /[?&]debug\b/.test(location.search);
+  const dbgLines = [];
+  let dbgEl = null;
+  function dbg(msg) {
+    if (!DEBUG) return;
+    const t = (performance.now() / 1000).toFixed(1);
+    dbgLines.push(`${t}s ${msg}`);
+    if (dbgLines.length > 18) dbgLines.shift();
+    if (!dbgEl) {
+      dbgEl = el('pre', 'dbg');
+      dbgEl.style.cssText = 'position:fixed;right:8px;top:8px;z-index:20;margin:0;padding:8px 10px;max-width:46vw;background:rgba(0,0,0,.8);color:#9ee6a8;font:12px/1.5 monospace;border-radius:8px;pointer-events:none;white-space:pre-wrap';
+      document.body.appendChild(dbgEl);
+    }
+    dbgEl.textContent = dbgLines.join('\n');
+  }
+
+  // ---------- 麥克風音量偵測 ----------
+  // Android 上同時開兩個麥克風來源會讓辨識失效，所以手機上不啟用，只靠看門狗
+  const VAD_OK = !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  let vad = null;           // { ctx, stream, analyser, buf }
+  let noiseFloor = 0.01;
+  let speakingMs = 0;       // 上次有辨識結果之後，累積偵測到的說話時間
+
+  async function startVAD() {
+    if (!VAD_OK || vad || !navigator.mediaDevices) return;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      if (!listening) { stream.getTracks().forEach(t => t.stop()); return; }
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      vad = { ctx, stream, analyser, buf: new Float32Array(analyser.fftSize) };
+      dbg('音量偵測啟動');
+    } catch (err) {
+      dbg('音量偵測無法啟動：' + err.message);
+    }
+  }
+
+  function stopVAD() {
+    if (!vad) return;
+    vad.stream.getTracks().forEach(t => t.stop());
+    try { vad.ctx.close(); } catch {}
+    vad = null;
+  }
+
+  // 回傳目前是否有人在說話
+  function isSpeaking() {
+    if (!vad) return false;
+    if (vad.ctx.state === 'suspended') vad.ctx.resume();
+    vad.analyser.getFloatTimeDomainData(vad.buf);
+    let sum = 0;
+    for (const v of vad.buf) sum += v * v;
+    const rms = Math.sqrt(sum / vad.buf.length);
+    // 背景噪音基準：安靜時慢慢跟上，有聲音時幾乎不動
+    noiseFloor += (rms - noiseFloor) * (rms < noiseFloor * 2 ? 0.05 : 0.002);
+    return rms > Math.max(0.02, noiseFloor * 3);
+  }
 
   function createRec() {
     const gen = ++recGen;
@@ -279,12 +345,16 @@
       if (!alive()) return;
       touch();
       everStarted = true;
+      dbg(`#${gen} 開始`);
       setStatus('listening');
     };
 
     r.onresult = e => {
       if (!alive()) return;
       touch();
+      lastResult = performance.now();
+      speakingMs = 0;
+      restartDelay = 150;
       let interim = '', gotFinal = false;
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i], txt = res[0].transcript;
@@ -302,12 +372,13 @@
       hearT = setTimeout(() => listening && setStatus('listening'), 700);
       onSpeech(q);
       // 連線太久，瀏覽器內部累積的結果會越來越多，趁一句話剛結束時換新連線
-      if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle();
+      if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle('連線超過 45 秒');
     };
 
     r.onerror = e => {
       if (!alive()) return;
       touch();
+      dbg(`#${gen} 錯誤：${e.error}`);
       switch (e.error) {
         case 'not-allowed':
         case 'service-not-allowed':
@@ -338,14 +409,21 @@
       if (!alive()) return;
       // 連線很快就結束 → 可能在出錯，拉長重試間隔；正常結束 → 馬上重啟
       const lived = performance.now() - sessionStart;
-      restartDelay = lived < 1500 ? Math.min(restartDelay * 2, 5000) : 250;
+      restartDelay = lived < 1500 ? Math.min(restartDelay * 2, MAX_BACKOFF_MS) : 150;
+      dbg(`#${gen} 結束（${(lived / 1000).toFixed(1)}s），${restartDelay}ms 後重啟`);
       scheduleRestart();
     };
 
     rec = r;
-    sessionStart = lastRecEvent = performance.now();
+    sessionStart = lastRecEvent = lastResult = performance.now();
+    speakingMs = 0;
+    dbg(`#${gen} start()`);
     try { r.start(); }
-    catch { restartDelay = Math.min(restartDelay * 2, 5000); scheduleRestart(); }
+    catch (err) {
+      dbg(`#${gen} start() 失敗：${err.message}`);
+      restartDelay = Math.min(restartDelay * 2, MAX_BACKOFF_MS);
+      scheduleRestart();
+    }
   }
 
   function scheduleRestart() {
@@ -356,14 +434,35 @@
     }, restartDelay);
   }
 
-  // 丟掉目前的連線，換一條新的
-  function recycle() {
+  // 丟掉目前的連線，等它真正關閉後再開一條新的（最多等 1 秒）
+  function recycle(reason) {
+    dbg('換新連線：' + reason);
     const old = rec;
     recGen++;           // 讓舊連線之後的事件全部失效
     rec = null;
-    if (old) { try { old.abort(); } catch {} }
-    restartDelay = 250;
-    scheduleRestart();
+    clearTimeout(restartT);
+    restartDelay = 50;
+    if (!old) return scheduleRestart();
+    let done = false;
+    const go = () => { if (!done) { done = true; scheduleRestart(); } };
+    old.onend = go;
+    setTimeout(go, 1000);
+    try { old.abort(); } catch { go(); }
+  }
+
+  const TICK_MS = 250;
+  function watchdogTick() {
+    if (!listening || document.hidden || !rec) return;
+    const now = performance.now();
+    // 聽到你在說話，辨識卻沒有回應 → 卡住了
+    if (isSpeaking()) {
+      speakingMs += TICK_MS;
+      if (speakingMs >= STALL_SPEECH_MS && now - lastResult > STALL_SPEECH_MS && now - sessionStart > 1500) {
+        speakingMs = 0;
+        return recycle('有說話但辨識沒回應');
+      }
+    }
+    if (now - lastRecEvent > WATCHDOG_MS) recycle('太久沒有任何事件');
   }
 
   function startListening() {
@@ -371,17 +470,15 @@
     if (!tokens.length) { toast('稿子是空的'); return false; }
     listening = true;
     everStarted = false;
-    restartDelay = 250;
+    restartDelay = 150;
     lastProgress = performance.now();
     heardFinal = [];
     heardText = '';
     setStatus('listening', '啟動中…');
     createRec();
+    startVAD();
     clearInterval(watchdogT);
-    watchdogT = setInterval(() => {
-      if (!listening || document.hidden) return;
-      if (performance.now() - lastRecEvent > WATCHDOG_MS) recycle();
-    }, 2000);
+    watchdogT = setInterval(watchdogTick, TICK_MS);
     return true;
   }
 
@@ -391,6 +488,7 @@
     clearTimeout(restartT);
     clearInterval(watchdogT);
     if (rec) { try { rec.abort(); } catch {} rec = null; }
+    stopVAD();
     setStatus('');
   }
 
@@ -711,7 +809,7 @@
   document.addEventListener('visibilitychange', async () => {
     if (document.hidden || prompter.hidden) return;
     // 切回分頁：瀏覽器在背景時會中斷辨識，換一條新連線
-    if (listening) recycle();
+    if (listening) recycle('切回分頁');
     // 螢幕常亮鎖也會被系統釋放，重新取得
     try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   });
