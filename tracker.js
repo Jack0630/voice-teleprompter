@@ -137,8 +137,10 @@
     if (hangul > 5) return 'ko-KR';
     if (han > latin / 4) {
       // 繁簡判斷：看繁體字多還是簡體字多
+      // 「台出面回只表」這類字既是某些字的簡體，本身也是常用繁體字，不能當成簡體的證據
+      const SHARED = '台只里干面系出松表板胡采回周余志御困托注游制征郁后云范准划朴丑斗';
       let t = 0, s = 0;
-      const simp = new Set(Object.values(T2S));
+      const simp = new Set(Object.values(T2S).filter(c => !SHARED.includes(c)));
       for (const c of text) { if (T2S[c]) t++; else if (simp.has(c)) s++; }
       return s > t ? 'zh-CN' : 'zh-TW';
     }

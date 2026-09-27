@@ -22,16 +22,23 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
+  const APP_VERSION = '1.3.0';
+  const SETTINGS_VERSION = 2;
   const DEFAULTS = {
-    script: SAMPLE, mode: 'voice', lang: 'auto',
+    script: SAMPLE, mode: 'voice', lang: 'zh-TW',
     fontSize: 52, lineHeight: 1.5, width: 80, bandSize: 45, speed: 60,
     camera: false, mirror: false, showHeard: true,
+    v: SETTINGS_VERSION,
   };
   const STORE_KEY = 'voice-teleprompter-v1';
 
   function load() {
-    try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); }
-    catch { return Object.assign({}, DEFAULTS); }
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch {}
+    // 舊版預設是「自動偵測」，升級時改成中文（台灣）；之後使用者自己選的就不動
+    if ((saved.v || 1) < 2 && saved.lang === 'auto') saved.lang = 'zh-TW';
+    saved.v = SETTINGS_VERSION;
+    return Object.assign({}, DEFAULTS, saved);
   }
   let saveT;
   function save() {
@@ -239,15 +246,19 @@
     statusEl.textContent = text != null ? text : ({ listening: '聆聽中', hearing: '聆聽中', error: '錯誤' }[s] || '已暫停');
   }
 
+  // 回傳追蹤結果的說明文字（寫進事件紀錄）
   function onSpeech(q) {
     const r = Tracker.locate(tokens, q, cursor);
-    if (!r) return;                                   // 對不上（脫稿／雜音）→ 安靜等待
-    if (r.pos < cursor && r.pos >= cursor - 4) return; // 小幅倒退視為抖動，忽略
+    if (!r) return '對不上稿子，等待';                          // 脫稿／雜音 → 安靜等待
+    if (r.pos < cursor && r.pos >= cursor - 4) return '小幅倒退，忽略'; // 視為抖動
+    const from = cursor;
     if (r.pos !== cursor) {
       setCursor(r.pos);
       manualUntil = 0;
     }
     lastProgress = performance.now();
+    if (Math.abs(r.pos - from) > 30) Report.log('track', `跳到第 ${r.pos} 字（原本在第 ${from} 字）`);
+    return `位置 ${cursor}/${tokens.length}`;
   }
 
   // Chrome 的連續辨識會不定時自己斷線，說話說到一半還會「靜默卡住」（不回結果、不報錯、不觸發 onend）。
@@ -269,21 +280,16 @@
   const MAX_SESSION_MS = 45000; // 單條連線用太久 → 趁句子結束時換新的
   const MAX_BACKOFF_MS = 2000;
 
-  // ---------- 除錯紀錄（網址加上 ?debug 顯示） ----------
+  // ---------- 事件紀錄（寫進問題回報；網址加上 ?debug 會在右上角即時顯示） ----------
   const DEBUG = /[?&]debug\b/.test(location.search);
-  const dbgLines = [];
-  let dbgEl = null;
-  function dbg(msg) {
-    if (!DEBUG) return;
-    const t = (performance.now() / 1000).toFixed(1);
-    dbgLines.push(`${t}s ${msg}`);
-    if (dbgLines.length > 18) dbgLines.shift();
-    if (!dbgEl) {
-      dbgEl = el('pre', 'dbg');
-      dbgEl.style.cssText = 'position:fixed;right:8px;top:8px;z-index:20;margin:0;padding:8px 10px;max-width:46vw;background:rgba(0,0,0,.8);color:#9ee6a8;font:12px/1.5 monospace;border-radius:8px;pointer-events:none;white-space:pre-wrap';
-      document.body.appendChild(dbgEl);
-    }
-    dbgEl.textContent = dbgLines.join('\n');
+  function dbg(msg, level) { Report.log('rec', msg, level); }
+  if (DEBUG) {
+    const box = el('pre', 'dbg');
+    box.style.cssText = 'position:fixed;right:8px;top:8px;z-index:20;margin:0;padding:8px 10px;max-width:46vw;background:rgba(0,0,0,.8);color:#9ee6a8;font:12px/1.5 monospace;border-radius:8px;pointer-events:none;white-space:pre-wrap';
+    document.body.appendChild(box);
+    const draw = () => { box.textContent = Report.recent(18).map(Report.formatEvent).join('\n'); };
+    Report.onChange(draw);
+    draw();
   }
 
   // ---------- 麥克風音量偵測 ----------
@@ -305,7 +311,7 @@
       vad = { ctx, stream, analyser, buf: new Float32Array(analyser.fftSize) };
       dbg('音量偵測啟動');
     } catch (err) {
-      dbg('音量偵測無法啟動：' + err.message);
+      dbg('音量偵測無法啟動：' + err.message, 'warn');
     }
   }
 
@@ -355,22 +361,29 @@
       lastResult = performance.now();
       speakingMs = 0;
       restartDelay = 150;
-      let interim = '', gotFinal = false;
+      let interim = '', finalText = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i], txt = res[0].transcript;
         if (res.isFinal) {
           heardFinal.push(...Tracker.tokenize(txt));
           heardText = (heardText + txt).slice(-80);
-          gotFinal = true;
+          finalText += txt;
         } else interim += txt;
       }
+      const gotFinal = !!finalText;
       if (heardFinal.length > 80) heardFinal = heardFinal.slice(-QLEN * 2);
       const q = heardFinal.concat(Tracker.tokenize(interim)).slice(-QLEN);
       heardEl.textContent = (heardText + interim).slice(-60) || '…';
       setStatus('hearing');
       clearTimeout(hearT);
       hearT = setTimeout(() => listening && setStatus('listening'), 700);
-      onSpeech(q);
+      const outcome = onSpeech(q);
+      // 只記錄完整的句子（中間結果太頻繁）
+      if (gotFinal) {
+        Report.count('辨識到的句子');
+        const shown = finalText.length > 24 ? '…' + finalText.slice(-24) : finalText;
+        dbg(`#${gen} 聽到「${shown}」→ ${outcome}`);
+      }
       // 連線太久，瀏覽器內部累積的結果會越來越多，趁一句話剛結束時換新連線
       if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle('連線超過 45 秒');
     };
@@ -378,7 +391,10 @@
     r.onerror = e => {
       if (!alive()) return;
       touch();
-      dbg(`#${gen} 錯誤：${e.error}`);
+      // no-speech（沒聽到聲音）、aborted（被我們主動中止）是正常現象
+      const level = { 'no-speech': 'info', 'aborted': 'info', 'network': 'warn', 'audio-capture': 'warn' }[e.error] || 'error';
+      Report.count('辨識錯誤：' + e.error);
+      dbg(`#${gen} 錯誤：${e.error}${e.message ? '（' + e.message + '）' : ''}`, level);
       switch (e.error) {
         case 'not-allowed':
         case 'service-not-allowed':
@@ -420,7 +436,8 @@
     dbg(`#${gen} start()`);
     try { r.start(); }
     catch (err) {
-      dbg(`#${gen} start() 失敗：${err.message}`);
+      Report.count('start() 失敗');
+      dbg(`#${gen} start() 失敗：${err.message}`, 'warn');
       restartDelay = Math.min(restartDelay * 2, MAX_BACKOFF_MS);
       scheduleRestart();
     }
@@ -435,8 +452,11 @@
   }
 
   // 丟掉目前的連線，等它真正關閉後再開一條新的（最多等 1 秒）
+  // 正常的例行換連線；其他原因（卡住）記成警告
+  const ROUTINE_RECYCLE = ['連線超過 45 秒', '切回分頁'];
   function recycle(reason) {
-    dbg('換新連線：' + reason);
+    Report.count('換新連線：' + reason);
+    dbg('換新連線：' + reason, ROUTINE_RECYCLE.includes(reason) ? 'info' : 'warn');
     const old = rec;
     recGen++;           // 讓舊連線之後的事件全部失效
     rec = null;
@@ -475,6 +495,7 @@
     heardFinal = [];
     heardText = '';
     setStatus('listening', '啟動中…');
+    dbg(`開始聆聽（語言 ${recogLang()}，音量偵測${VAD_OK ? '開啟' : '在手機上停用'}）`);
     createRec();
     startVAD();
     clearInterval(watchdogT);
@@ -483,6 +504,7 @@
   }
 
   function stopListening() {
+    if (listening) dbg('停止聆聽');
     listening = false;
     recGen++;
     clearTimeout(restartT);
@@ -494,6 +516,7 @@
 
   // 無法自動恢復的情況：停下來並告訴使用者原因
   function pauseWith(msg) {
+    dbg('停止：' + msg, 'error');
     setPlaying(false);
     setStatus('error', msg);
   }
@@ -549,6 +572,7 @@
         });
         cam.srcObject = camStream;
       } catch (err) {
+        Report.log('cam', `無法開啟鏡頭：${err.name} ${err.message}`, 'error');
         toast('無法開啟鏡頭：' + err.message);
         on = false;
       }
@@ -572,6 +596,8 @@
     recorder = new MediaRecorder(camStream, type ? { mimeType: type, videoBitsPerSecond: 8e6 } : undefined);
     chunks = [];
     recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+    recorder.onerror = e => Report.log('cam', '錄影錯誤：' + (e.error ? e.error.message : '未知'), 'error');
+    Report.log('cam', '開始錄影（' + (type || '瀏覽器預設格式') + '）');
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: recorder.mimeType });
       const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
@@ -618,6 +644,7 @@
       cursor = i < 0 ? 0 : i;
     } else cursor = 0;
 
+    Report.log('ui', `開始提詞（${S.mode === 'voice' ? '語音追蹤' : '固定速度'}，${tokens.length} 字，從第 ${cursor} 字開始）`);
     editor.hidden = true;
     prompter.hidden = false;
     relayout();
@@ -631,6 +658,7 @@
   }
 
   function openEditor() {
+    Report.log('ui', '回到編輯頁');
     setPlaying(false);
     setCamera(false);
     try { wakeLock?.release(); } catch {}
@@ -702,6 +730,10 @@
 
   // ================= 鍵盤 =================
   document.addEventListener('keydown', e => {
+    if (!reportDlg.hidden) {
+      if (e.key === 'Escape') closeReport();
+      return; // 回報視窗開著時，不觸發提詞器的快捷鍵
+    }
     if (prompter.hidden) {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); openPrompter(); }
       return;
@@ -781,8 +813,11 @@
 
   ta.addEventListener('input', () => { S.script = ta.value; save(); updateStats(); });
 
+  // 章節標題不用念，不算進字數
+  const stripChapters = text => text.replace(/^\s*#.*$/gm, '');
+
   function updateStats() {
-    const n = Tracker.tokenize(ta.value).length;
+    const n = Tracker.tokenize(stripChapters(ta.value)).length;
     const lang = S.lang === 'auto' ? Tracker.detectLang(ta.value) : S.lang;
     const perMin = /^(zh|yue|ja|ko|cmn)/.test(lang) ? 240 : 150; // 中文約每分鐘 240 字，英文約 150 詞
     const sec = Math.round(n / perMin * 60);
@@ -790,9 +825,119 @@
     $('#stats').textContent = `${n} 字・預估 ${Math.floor(sec / 60)} 分 ${sec % 60} 秒・${chs} 個章節・辨識語言 ${lang}`;
   }
 
+  // ================= 問題回報 =================
+  const reportDlg = $('#reportDlg'), reportText = $('#reportText'), reportDesc = $('#reportDesc');
+  const ISSUE_URL = 'https://github.com/Jack0630/voice-teleprompter/issues/new';
+  let lastReport = '';
+
+  function reportEnv() {
+    const { script, ...settings } = S;
+    return {
+      '程式版本': APP_VERSION,
+      '畫面': prompter.hidden ? '編輯頁' : '提詞頁',
+      '模式': S.mode === 'voice' ? '語音追蹤' : '固定速度',
+      '辨識語言': recogLang() + (S.lang === 'auto' ? '（自動偵測）' : ''),
+      '瀏覽器支援語音辨識': SR ? '是' : '否',
+      '正在聆聽': listening ? '是' : '否',
+      '音量偵測': vad ? '運作中' : (VAD_OK ? '未運作' : '手機上停用'),
+      '鏡頭': camStream ? '開啟' : '關閉',
+      '稿子': `${Tracker.tokenize(stripChapters(script)).length} 字、${(script.match(/^\s*#/gm) || []).length} 個章節`,
+      '目前位置': `第 ${cursor} 字 / 共 ${tokens.length} 字`,
+      '設定': settings,
+    };
+  }
+
+  async function refreshReport() {
+    lastReport = await Report.build({ description: reportDesc.value, env: reportEnv() });
+    reportText.textContent = lastReport;
+  }
+
+  function openReport() {
+    Report.clearAlerts();
+    reportDlg.hidden = false;
+    refreshReport();
+    reportDesc.focus();
+  }
+  function closeReport() { reportDlg.hidden = true; }
+
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch {
+      // 備援：選取文字後用舊方法複製
+      const tmp = el('textarea');
+      tmp.value = text;
+      tmp.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(tmp);
+      tmp.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch {}
+      tmp.remove();
+      return ok;
+    }
+  }
+
+  function stampName() {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  }
+
+  // GitHub 網址長度有限：放不下就保留開頭的環境資訊＋最後面的事件
+  function fitForUrl(text, limit = 6000) {
+    if (encodeURIComponent(text).length <= limit) return text;
+    const lines = text.split('\n');
+    const head = lines.findIndex(l => l.startsWith('【事件紀錄'));
+    const top = lines.slice(0, head + 1);
+    const note = '（紀錄太長已截斷，完整報告已複製到剪貼簿，可以貼在這下面）';
+    const tail = [];
+    for (let i = lines.length - 1; i > head; i--) {
+      const next = [...top, note, lines[i], ...tail].join('\n');
+      if (encodeURIComponent(next).length > limit) break;
+      tail.unshift(lines[i]);
+    }
+    return [...top, note, ...tail].join('\n');
+  }
+
+  document.querySelectorAll('.report-btn').forEach(b => b.onclick = openReport);
+  $('#reportClose').onclick = closeReport;
+  reportDlg.addEventListener('pointerdown', e => { if (e.target === reportDlg) closeReport(); });
+  let descT;
+  reportDesc.addEventListener('input', () => { clearTimeout(descT); descT = setTimeout(refreshReport, 300); });
+
+  $('#reportCopy').onclick = async () => {
+    await refreshReport();
+    toast(await copyText(lastReport) ? '報告已複製，可以直接貼上' : '複製失敗，請手動選取下方文字複製');
+  };
+  $('#reportDownload').onclick = async () => {
+    await refreshReport();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([lastReport], { type: 'text/plain;charset=utf-8' }));
+    a.download = `提詞器問題回報_${stampName()}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  };
+  $('#reportGithub').onclick = async () => {
+    await refreshReport();
+    await copyText(lastReport);
+    const first = reportDesc.value.trim().split('\n')[0].slice(0, 40);
+    const title = '問題回報：' + (first || '語音辨識異常');
+    const body = '```\n' + fitForUrl(lastReport) + '\n```';
+    window.open(`${ISSUE_URL}?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`, '_blank', 'noopener');
+  };
+
+  // 有警告或錯誤時，🐞 按鈕亮紅點
+  function updateBadges() {
+    const n = Report.alertCount;
+    document.querySelectorAll('.report-btn .badge').forEach(b => {
+      b.hidden = n === 0;
+      b.textContent = n > 99 ? '99+' : n;
+    });
+  }
+  Report.onChange(updateBadges);
+
   // ================= 其他 =================
   let toastT;
   function toast(msg) {
+    Report.log('ui', '提示：' + msg, 'info');
     const t = $('#toast');
     t.textContent = msg;
     t.hidden = false;
@@ -807,6 +952,7 @@
   });
 
   document.addEventListener('visibilitychange', async () => {
+    Report.log('env', document.hidden ? '分頁切到背景' : '分頁回到前景');
     if (document.hidden || prompter.hidden) return;
     // 切回分頁：瀏覽器在背景時會中斷辨識，換一條新連線
     if (listening) recycle('切回分頁');
@@ -820,5 +966,7 @@
   syncInputs();
   syncSeg();
   updateStats();
+  updateBadges();
+  Report.log('env', `程式版本 ${APP_VERSION} 啟動，辨識語言 ${recogLang()}`);
   requestAnimationFrame(frame);
 })();
