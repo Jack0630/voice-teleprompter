@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.3.0';
+  const APP_VERSION = '1.3.1';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -188,6 +188,7 @@
   function jumpTo(i) {
     setCursor(i);
     heardFinal = [];
+    pendingJump = null;
     lastProgress = performance.now();
     liftedTop = null;
     manualUntil = 0;
@@ -246,11 +247,30 @@
     statusEl.textContent = text != null ? text : ({ listening: '聆聽中', hearing: '聆聽中', error: '錯誤' }[s] || '已暫停');
   }
 
+  // 稿子在某個位置前後的片段（▍標出目前位置）
+  function scriptAround(i) {
+    const txt = (a, b) => tokEls.slice(Math.max(0, a), Math.max(0, b)).map(e => e.textContent).join('');
+    return txt(i - 4, i) + '▍' + txt(i, i + 16);
+  }
+
+  // 大跳躍（往回超過 4 字、往前超過 30 字）要連續兩次結果都指向同一處才採用，
+  // 避免辨識途中的暫時結果被改寫時，位置來回亂跳
+  let pendingJump = null;
+  const JUMP_BACK = 4, JUMP_AHEAD = 30, JUMP_AGREE = 8;
+
   // 回傳追蹤結果的說明文字（寫進事件紀錄）
   function onSpeech(q) {
     const r = Tracker.locate(tokens, q, cursor);
     if (!r) return '對不上稿子，等待';                          // 脫稿／雜音 → 安靜等待
-    if (r.pos < cursor && r.pos >= cursor - 4) return '小幅倒退，忽略'; // 視為抖動
+    const d = r.pos - cursor;
+    if (d < 0 && d >= -JUMP_BACK) return '小幅倒退，忽略';      // 視為抖動
+    if (d < -JUMP_BACK || d > JUMP_AHEAD) {
+      if (!pendingJump || Math.abs(pendingJump - r.pos) > JUMP_AGREE) {
+        pendingJump = r.pos;
+        return `可能跳到第 ${r.pos} 字，等下一次確認`;
+      }
+    }
+    pendingJump = null;
     const from = cursor;
     if (r.pos !== cursor) {
       setCursor(r.pos);
@@ -382,7 +402,10 @@
       if (gotFinal) {
         Report.count('辨識到的句子');
         const shown = finalText.length > 24 ? '…' + finalText.slice(-24) : finalText;
-        dbg(`#${gen} 聽到「${shown}」→ ${outcome}`);
+        const lost = outcome.startsWith('對不上');
+        if (lost) Report.count('辨識到的句子：對不上稿子');
+        // 對不上時附上稿子目前位置的前後片段，才看得出是辨識錯還是稿子寫法不同
+        dbg(`#${gen} 聽到「${shown}」→ ${outcome}` + (lost ? `｜稿子此處「${scriptAround(cursor)}」` : ''));
       }
       // 連線太久，瀏覽器內部累積的結果會越來越多，趁一句話剛結束時換新連線
       if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle('連線超過 45 秒');
@@ -716,6 +739,7 @@
     if (S.mode === 'voice') {
       setCursor(tokenAt(y + anchorPx()));
       heardFinal = [];
+      pendingJump = null;
       lastProgress = performance.now();
     }
   }

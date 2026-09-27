@@ -106,9 +106,17 @@
         if (left > h) h = left;
         cur[i] = h > 0 ? h : 0;
       }
-      const score = cur[m];
-      // 對齊必須以「最新聽到的字」結尾，且結尾在稿子的字上真的對到
-      if (score > 0 && sim(query[m - 1], t) > 0) {
+      // 對齊的結尾必須是「真的對上」的字。
+      // 但最新聽到的字最容易辨識錯（下一句的開頭常被聽成別的字），
+      // 所以允許結尾最多有 2 個對不上的字，每個扣一點分
+      let score = 0;
+      for (let k = 0; k <= 2 && m - k >= 1; k++) {
+        if (sim(query[m - 1 - k], t) > 0) {
+          const s = cur[m - k] - k * 0.5;
+          if (s > score) score = s;
+        }
+      }
+      if (score > 0) {
         const pos = j; // 念完第 j 個 token → cursor 移到 j
         const d = pos - cursor;
         const near = d >= -nearBack && d <= nearAhead;
