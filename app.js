@@ -1,0 +1,637 @@
+(() => {
+  'use strict';
+
+  const $ = s => document.querySelector(s);
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  const SAMPLE = `# 開場
+大家好，歡迎使用這個語音提詞器。
+它會跟著你說話的速度往下捲動，你說快它就快，你說慢它就慢，你停下來它也會停下來。
+
+# 說錯了也不怕
+就算你念錯了幾個字，或者臨時換了一個說法，它也會靠上下文找到你現在念到哪一行。
+如果你想回頭重講一段，直接從那一段開始念，它會自動跳回去。
+想跳過中間幾行，也可以直接念後面的內容。
+如果你即興脫稿講一段，它會安靜地等你回來。
+
+# 眼神貼近鏡頭
+提詞的區域放在畫面最上方，也就是最靠近鏡頭的位置。
+你正在念的那一行會盡量停在上方。當你卡住停下來的時候，還沒念的內容會被輕輕地提到更靠近鏡頭的地方。
+
+# 小技巧
+長按畫面任何地方，就可以回到編輯頁修改稿子。
+開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
+
+  const DEFAULTS = {
+    script: SAMPLE, mode: 'voice', lang: 'auto',
+    fontSize: 52, lineHeight: 1.5, width: 80, bandSize: 45, speed: 60,
+    camera: false, mirror: false, showHeard: true,
+  };
+  const STORE_KEY = 'voice-teleprompter-v1';
+
+  function load() {
+    try { return Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem(STORE_KEY) || '{}')); }
+    catch { return Object.assign({}, DEFAULTS); }
+  }
+  let saveT;
+  function save() {
+    clearTimeout(saveT);
+    saveT = setTimeout(() => { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch {} }, 300);
+  }
+
+  const S = load();
+
+  // ---------- DOM ----------
+  const editor = $('#editor'), prompter = $('#prompter');
+  const ta = $('#script'), track = $('#track'), band = $('#band'), marker = $('#marker');
+  const bar = $('#bar'), heardEl = $('#heard'), statusEl = $('#status');
+  const cam = $('#cam'), btnPlay = $('#btnPlay'), btnRec = $('#btnRec'), recTime = $('#recTime');
+
+  // ---------- 稿子狀態 ----------
+  let tokens = [], tokEls = [], tokSrc = [], tops = [], chapters = [];
+  let renderedKey = '';
+  let cursor = 0, painted = 0;
+  let lineH = 78;
+
+  // ---------- 捲動狀態 ----------
+  let y = 0, playing = false, lastT = 0;
+  let manualUntil = 0;       // 使用者手動拖曳期間，暫停自動對位
+  let lastProgress = 0;      // 上一次語音推進的時間
+  let liftedTop = null;      // 停頓時「把沒讀的內容提上來」
+
+  // ---------- 語音狀態 ----------
+  let rec = null, listening = false;
+  let heardFinal = [], heardText = '', hearT;
+  const QLEN = 16;
+
+  // ================= 渲染 =================
+  function el(tag, cls, text) {
+    const d = document.createElement(tag);
+    if (cls) d.className = cls;
+    if (text != null) d.textContent = text;
+    return d;
+  }
+
+  function render() {
+    const key = S.mode + '\u0000' + S.script;
+    if (key === renderedKey) return;
+    renderedKey = key;
+
+    tokens = []; tokEls = []; tokSrc = []; chapters = [];
+    const frag = document.createDocumentFragment();
+    let off = 0, prevBlank = true;
+    for (const line of S.script.split('\n')) {
+      const trimmed = line.trim();
+      if (/^#/.test(trimmed)) {
+        const title = trimmed.replace(/^#+\s*/, '');
+        const d = el('div', 'chapter', title);
+        chapters.push({ title, i: tokens.length });
+        frag.appendChild(d);
+      } else if (!trimmed) {
+        // 語音模式：空行自動壓縮；固定速度模式：保留（最多一個）
+        if (S.mode === 'fixed' && !prevBlank) frag.appendChild(el('div', 'blank'));
+      } else {
+        const d = el('div', 'line');
+        for (const seg of Tracker.segment(line)) {
+          if (seg.norm === null) { d.appendChild(document.createTextNode(seg.text)); continue; }
+          const sp = el('span', 'tk', seg.text);
+          sp.dataset.i = tokens.length;
+          tokens.push(seg.norm);
+          tokEls.push(sp);
+          tokSrc.push(off + seg.start);
+          d.appendChild(sp);
+        }
+        frag.appendChild(d);
+      }
+      prevBlank = !trimmed;
+      off += line.length + 1;
+    }
+    track.textContent = '';
+    track.appendChild(frag);
+    painted = 0;
+    cursor = Math.min(cursor, tokens.length);
+
+    const box = $('#chapters');
+    box.textContent = '';
+    chapters.forEach((c, k) => {
+      const b = el('button', null, c.title || `第 ${k + 1} 段`);
+      b.onclick = () => jumpTo(c.i);
+      c.btn = b;
+      box.appendChild(b);
+    });
+  }
+
+  function relayout() {
+    track.style.fontSize = S.fontSize + 'px';
+    track.style.lineHeight = S.lineHeight;
+    track.style.width = S.width + '%';
+    band.style.height = S.bandSize + '%';
+    prompter.classList.toggle('mirror', S.mirror);
+    lineH = S.fontSize * S.lineHeight;
+    tops = tokEls.map(e => e.offsetTop);
+    paint();
+  }
+
+  function paint() {
+    const c = Math.min(cursor, tokEls.length);
+    if (c > painted) for (let i = painted; i < c; i++) tokEls[i].classList.add('read');
+    else for (let i = c; i < painted; i++) tokEls[i].classList.remove('read');
+    painted = c;
+
+    let cur = -1;
+    chapters.forEach((ch, k) => { if (ch.i <= cursor) cur = k; });
+    chapters.forEach((ch, k) => ch.btn && ch.btn.classList.toggle('on', k === cur));
+  }
+
+  // ================= 位置計算 =================
+  function anchorPx() {
+    const bh = band.clientHeight;
+    const normal = Math.min(Math.max(lineH * 0.9, bh * 0.2), bh * 0.45);
+    const lifted = lineH * 0.15;
+    if (S.mode !== 'voice' || !listening || cursor === 0 || cursor >= tokens.length) { liftedTop = null; return normal; }
+    const top = tops[cursor];
+    if (liftedTop !== null && liftedTop === top) return lifted;
+    liftedTop = null;
+    if (performance.now() - lastProgress > 1800) { liftedTop = top; return lifted; }
+    return normal;
+  }
+
+  function topOf(i) {
+    if (!tops.length) return 0;
+    if (i >= tops.length) return tops[tops.length - 1] + lineH;
+    return tops[Math.max(0, i)];
+  }
+
+  // 找到畫面某個高度對應的第一個 token
+  function tokenAt(py) {
+    let lo = 0, hi = tops.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (tops[mid] + lineH / 2 < py) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+  }
+
+  function setCursor(i) {
+    cursor = Math.max(0, Math.min(tokens.length, i));
+    paint();
+  }
+
+  // 使用者主動改變位置（點字、章節、方向鍵）
+  function jumpTo(i) {
+    setCursor(i);
+    heardFinal = [];
+    lastProgress = performance.now();
+    liftedTop = null;
+    manualUntil = 0;
+    if (S.mode === 'fixed') y = topOf(cursor) - anchorPx();
+  }
+
+  function lineStep(dir) {
+    const cur = Math.min(cursor, tops.length - 1);
+    if (cur < 0) return;
+    const t = tops[cur];
+    if (dir > 0) {
+      let i = cur;
+      while (i < tops.length && tops[i] <= t + 2) i++;
+      jumpTo(i);
+    } else {
+      let i = cur - 1;
+      while (i >= 0 && tops[i] >= t - 2) i--;
+      if (i < 0) return jumpTo(0);
+      const pt = tops[i];
+      while (i > 0 && tops[i - 1] >= pt - 2) i--;
+      jumpTo(i);
+    }
+  }
+
+  // ================= 動畫迴圈 =================
+  function frame(t) {
+    const dt = Math.min(0.1, (t - lastT) / 1000 || 0);
+    lastT = t;
+    if (!prompter.hidden) {
+      const anchor = anchorPx();
+      const maxY = topOf(tokens.length) - anchor;
+      if (S.mode === 'fixed') {
+        if (playing && t > manualUntil) {
+          y += S.speed * dt;
+          if (y >= maxY) { y = maxY; setPlaying(false); }
+        }
+        const c = tokenAt(y + anchor);
+        if (c !== cursor) setCursor(c);
+      } else if (t > manualUntil) {
+        const target = topOf(cursor) - anchor;
+        y += (target - y) * (1 - Math.exp(-dt * 6));
+      }
+      track.style.transform = `translateY(${-y}px)`;
+      marker.style.top = (anchor + lineH / 2 - 10) + 'px';
+    }
+    requestAnimationFrame(frame);
+  }
+
+  // ================= 語音辨識 =================
+  function recogLang() {
+    return S.lang === 'auto' ? Tracker.detectLang(S.script) : S.lang;
+  }
+
+  function setStatus(s, text) {
+    statusEl.className = 'status ' + (s || '');
+    statusEl.textContent = text != null ? text : ({ listening: '聆聽中', hearing: '聆聽中', error: '錯誤' }[s] || '已暫停');
+  }
+
+  function onSpeech(q) {
+    const r = Tracker.locate(tokens, q, cursor);
+    if (!r) return;                                   // 對不上（脫稿／雜音）→ 安靜等待
+    if (r.pos < cursor && r.pos >= cursor - 4) return; // 小幅倒退視為抖動，忽略
+    if (r.pos !== cursor) {
+      setCursor(r.pos);
+      manualUntil = 0;
+    }
+    lastProgress = performance.now();
+  }
+
+  function startListening() {
+    if (!SR) { toast('這個瀏覽器不支援語音辨識，請用 Chrome 或 Edge。'); return false; }
+    if (!tokens.length) { toast('稿子是空的'); return false; }
+    rec = new SR();
+    rec.lang = recogLang();
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.maxAlternatives = 1;
+
+    rec.onresult = e => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const r = e.results[i], txt = r[0].transcript;
+        if (r.isFinal) {
+          heardFinal.push(...Tracker.tokenize(txt));
+          heardText = (heardText + txt).slice(-80);
+        } else interim += txt;
+      }
+      if (heardFinal.length > 80) heardFinal = heardFinal.slice(-QLEN * 2);
+      const q = heardFinal.concat(Tracker.tokenize(interim)).slice(-QLEN);
+      heardEl.textContent = (heardText + interim).slice(-60) || '…';
+      setStatus('hearing');
+      clearTimeout(hearT);
+      hearT = setTimeout(() => listening && setStatus('listening'), 700);
+      onSpeech(q);
+    };
+
+    rec.onerror = e => {
+      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+        stopListening();
+        setStatus('error', '無麥克風權限');
+        toast('麥克風權限被拒絕。請點網址列左側的圖示允許麥克風，然後再按一次 ▶。');
+      } else if (e.error === 'network') {
+        setStatus('error', '網路錯誤');
+        toast('語音辨識需要網路（Chrome／Edge 的辨識服務在雲端）。');
+      } else if (e.error === 'language-not-supported') {
+        stopListening();
+        toast('這個瀏覽器不支援「' + rec.lang + '」的語音辨識。');
+      }
+      // no-speech / aborted：onend 會自動重啟
+    };
+
+    // Chrome 大約每隔一段時間會自己結束，持續重啟
+    rec.onend = () => {
+      if (!listening) return;
+      setTimeout(() => { if (listening) try { rec.start(); } catch {} }, 120);
+    };
+
+    try { rec.start(); } catch (err) { toast('無法啟動語音辨識：' + err.message); return false; }
+    listening = true;
+    lastProgress = performance.now();
+    heardFinal = [];
+    setStatus('listening');
+    return true;
+  }
+
+  function stopListening() {
+    listening = false;
+    if (rec) { try { rec.abort(); } catch {} rec = null; }
+    setStatus('');
+  }
+
+  // ================= 播放控制 =================
+  function setPlaying(on) {
+    if (S.mode === 'voice') {
+      if (on) on = startListening(); else stopListening();
+      playing = on;
+    } else {
+      stopListening();
+      playing = on;
+      setStatus(on ? 'listening' : '', on ? '捲動中' : '已暫停');
+    }
+    btnPlay.textContent = playing ? '❚❚' : '▶';
+    heardEl.hidden = !(S.showHeard && S.mode === 'voice' && playing);
+    if (!playing) bar.classList.remove('dim');
+    else poke();
+  }
+
+  function setMode(m) {
+    if (m === S.mode) return;
+    const wasPlaying = playing;
+    setPlaying(false);
+    S.mode = m; save();
+    syncSeg();
+    const keep = cursor;
+    render();
+    if (!prompter.hidden) {
+      relayout();
+      setCursor(keep);
+      y = topOf(cursor) - anchorPx();
+      if (wasPlaying) setPlaying(true);
+    }
+    $('#speedCtl').hidden = m !== 'fixed';
+  }
+
+  function syncSeg() {
+    document.querySelectorAll('#modeSeg button, #modeSeg2 button').forEach(b => b.classList.toggle('on', b.dataset.v === S.mode));
+    $('#speedCtl').hidden = S.mode !== 'fixed';
+    $('#speedLabel').textContent = S.speed + ' px/s';
+  }
+
+  // ================= 鏡頭與錄影 =================
+  let camStream = null, recorder = null, chunks = [], recStart = 0, recTimer;
+
+  async function setCamera(on) {
+    if (on && !camStream) {
+      try {
+        camStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 } },
+          audio: true,
+        });
+        cam.srcObject = camStream;
+      } catch (err) {
+        toast('無法開啟鏡頭：' + err.message);
+        on = false;
+      }
+    }
+    if (!on && camStream) {
+      stopRecording();
+      camStream.getTracks().forEach(t => t.stop());
+      camStream = null;
+      cam.srcObject = null;
+    }
+    cam.hidden = !on;
+    btnRec.hidden = !on;
+    prompter.classList.toggle('cam-on', on);
+    return on;
+  }
+
+  function startRecording() {
+    if (!camStream || !window.MediaRecorder) return;
+    const type = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm']
+      .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    recorder = new MediaRecorder(camStream, type ? { mimeType: type, videoBitsPerSecond: 8e6 } : undefined);
+    chunks = [];
+    recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: recorder.mimeType });
+      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+      const d = new Date(), p = n => String(n).padStart(2, '0');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `提詞錄影_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+      toast('錄影已下載');
+    };
+    recorder.start(1000);
+    recStart = Date.now();
+    btnRec.classList.add('on');
+    recTime.hidden = false;
+    recTimer = setInterval(() => {
+      const s = Math.floor((Date.now() - recStart) / 1000);
+      recTime.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    }, 250);
+  }
+
+  function stopRecording() {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    recorder = null;
+    clearInterval(recTimer);
+    btnRec.classList.remove('on');
+    recTime.hidden = true;
+    recTime.textContent = '0:00';
+  }
+
+  // ================= 切換頁面 =================
+  let wakeLock = null;
+
+  async function openPrompter() {
+    S.script = ta.value;
+    save();
+    render();
+    if (!tokens.length) { toast('先貼上稿子吧'); return; }
+
+    // 從編輯器游標位置開始
+    const pos = ta.selectionStart;
+    if (pos > 0 && pos < ta.value.length) {
+      let i = tokSrc.findIndex(s => s >= pos);
+      cursor = i < 0 ? 0 : i;
+    } else cursor = 0;
+
+    editor.hidden = true;
+    prompter.hidden = false;
+    relayout();
+    paint();
+    y = topOf(cursor) - anchorPx();
+    syncSeg();
+    if (S.camera) await setCamera(true);
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    if (S.mode === 'voice') setPlaying(true);
+    else setStatus('', '已暫停');
+  }
+
+  function openEditor() {
+    setPlaying(false);
+    setCamera(false);
+    try { wakeLock?.release(); } catch {}
+    wakeLock = null;
+    prompter.hidden = true;
+    editor.hidden = false;
+    const p = cursor < tokSrc.length ? tokSrc[cursor] : ta.value.length;
+    ta.focus();
+    ta.setSelectionRange(p, p);
+    ta.scrollTop = Math.max(0, (p / Math.max(1, ta.value.length)) * ta.scrollHeight - ta.clientHeight / 3);
+    updateStats();
+  }
+
+  // ================= 互動：拖曳、點字、長按 =================
+  let down = null, pressT;
+
+  prompter.addEventListener('pointerdown', e => {
+    if (bar.contains(e.target)) return;
+    down = { x: e.clientX, y: e.clientY, sy: y, moved: false, long: false, target: e.target };
+    clearTimeout(pressT);
+    pressT = setTimeout(() => {
+      if (down && !down.moved) { down.long = true; openEditor(); }
+    }, 650);
+  });
+
+  prompter.addEventListener('pointermove', e => {
+    poke();
+    if (!down) return;
+    const dy = e.clientY - down.y;
+    if (!down.moved && Math.hypot(e.clientX - down.x, dy) > 8) { down.moved = true; clearTimeout(pressT); }
+    if (down.moved) manualScroll(down.sy - dy);
+  });
+
+  const endPress = () => {
+    clearTimeout(pressT);
+    if (down && !down.moved && !down.long) {
+      const t = down.target.closest && down.target.closest('.tk');
+      if (t) jumpTo(+t.dataset.i);
+      else if (S.mode === 'fixed') setPlaying(!playing);
+    }
+    down = null;
+  };
+  prompter.addEventListener('pointerup', endPress);
+  prompter.addEventListener('pointercancel', () => { clearTimeout(pressT); down = null; });
+
+  prompter.addEventListener('wheel', e => {
+    if (bar.contains(e.target)) return;
+    e.preventDefault();
+    manualScroll(y + e.deltaY);
+  }, { passive: false });
+
+  function manualScroll(ny) {
+    y = Math.max(-anchorPx(), ny);
+    manualUntil = performance.now() + 1200;
+    if (S.mode === 'voice') {
+      setCursor(tokenAt(y + anchorPx()));
+      heardFinal = [];
+      lastProgress = performance.now();
+    }
+  }
+
+  // 播放中控制列自動變淡，避免分心
+  let dimT;
+  function poke() {
+    bar.classList.remove('dim');
+    clearTimeout(dimT);
+    if (playing) dimT = setTimeout(() => playing && bar.classList.add('dim'), 3000);
+  }
+
+  // ================= 鍵盤 =================
+  document.addEventListener('keydown', e => {
+    if (prompter.hidden) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); openPrompter(); }
+      return;
+    }
+    const k = e.key;
+    if (k === ' ') { e.preventDefault(); setPlaying(!playing); }
+    else if (k === 'Escape') openEditor();
+    else if (k === 'ArrowDown' || k === 'PageDown') { e.preventDefault(); lineStep(1); }
+    else if (k === 'ArrowUp' || k === 'PageUp') { e.preventDefault(); lineStep(-1); }
+    else if (k === 'ArrowRight') changeSpeed(10);
+    else if (k === 'ArrowLeft') changeSpeed(-10);
+    else if (k === '+' || k === '=') changeFont(4);
+    else if (k === '-' || k === '_') changeFont(-4);
+    else if (k === 'Home') jumpTo(0);
+    else return;
+    poke();
+  });
+
+  function changeSpeed(d) {
+    S.speed = Math.max(10, Math.min(300, S.speed + d));
+    save(); syncSeg(); syncInputs();
+  }
+  function changeFont(d) {
+    S.fontSize = Math.max(24, Math.min(120, S.fontSize + d));
+    save(); syncInputs();
+    relayout();
+    y = topOf(cursor) - anchorPx();
+  }
+
+  // ================= 控制列 =================
+  btnPlay.onclick = () => setPlaying(!playing);
+  $('#btnEdit').onclick = openEditor;
+  $('#btnCam').onclick = async () => { S.camera = await setCamera(!camStream); save(); syncInputs(); };
+  btnRec.onclick = () => (recorder ? stopRecording() : startRecording());
+  bar.addEventListener('click', e => {
+    const a = e.target.dataset && e.target.dataset.act;
+    if (a === 'slower') changeSpeed(-10);
+    else if (a === 'faster') changeSpeed(10);
+    else if (a === 'smaller') changeFont(-4);
+    else if (a === 'bigger') changeFont(4);
+  });
+  document.querySelectorAll('#modeSeg button, #modeSeg2 button').forEach(b => b.onclick = () => setMode(b.dataset.v));
+
+  // ================= 編輯頁設定 =================
+  const ranges = {
+    fontSize: v => v + ' px',
+    lineHeight: v => (+v).toFixed(1),
+    width: v => v + '%',
+    bandSize: v => v + '%',
+    speed: v => v + ' px/s',
+  };
+
+  function syncInputs() {
+    for (const [k, fmt] of Object.entries(ranges)) {
+      $('#' + k).value = S[k];
+      $('#' + k + 'Out').textContent = fmt(S[k]);
+    }
+    $('#lang').value = S.lang;
+    $('#camera').checked = S.camera;
+    $('#mirror').checked = S.mirror;
+    $('#showHeard').checked = S.showHeard;
+  }
+
+  for (const k of Object.keys(ranges)) {
+    $('#' + k).addEventListener('input', e => {
+      S[k] = +e.target.value;
+      $('#' + k + 'Out').textContent = ranges[k](S[k]);
+      save();
+      syncSeg();
+    });
+  }
+  $('#lang').onchange = e => { S.lang = e.target.value; save(); updateStats(); };
+  $('#camera').onchange = e => { S.camera = e.target.checked; save(); };
+  $('#mirror').onchange = e => { S.mirror = e.target.checked; save(); };
+  $('#showHeard').onchange = e => { S.showHeard = e.target.checked; save(); };
+  $('#btnStart').onclick = openPrompter;
+
+  ta.addEventListener('input', () => { S.script = ta.value; save(); updateStats(); });
+
+  function updateStats() {
+    const n = Tracker.tokenize(ta.value).length;
+    const lang = S.lang === 'auto' ? Tracker.detectLang(ta.value) : S.lang;
+    const perMin = /^(zh|yue|ja|ko|cmn)/.test(lang) ? 240 : 150; // 中文約每分鐘 240 字，英文約 150 詞
+    const sec = Math.round(n / perMin * 60);
+    const chs = (ta.value.match(/^\s*#/gm) || []).length;
+    $('#stats').textContent = `${n} 字・預估 ${Math.floor(sec / 60)} 分 ${sec % 60} 秒・${chs} 個章節・辨識語言 ${lang}`;
+  }
+
+  // ================= 其他 =================
+  let toastT;
+  function toast(msg) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.hidden = false;
+    clearTimeout(toastT);
+    toastT = setTimeout(() => (t.hidden = true), 3500);
+  }
+
+  window.addEventListener('resize', () => {
+    if (prompter.hidden) return;
+    relayout();
+    y = topOf(cursor) - anchorPx();
+  });
+
+  document.addEventListener('visibilitychange', async () => {
+    // 切回分頁時螢幕常亮鎖會被系統釋放，重新取得
+    if (!document.hidden && !prompter.hidden) {
+      try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+    }
+  });
+
+  // 初始化
+  ta.value = S.script;
+  if (!SR) $('#srWarn').hidden = false;
+  syncInputs();
+  syncSeg();
+  updateStats();
+  requestAnimationFrame(frame);
+})();

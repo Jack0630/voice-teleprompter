@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>語音提詞器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ 編輯頁 ============ -->
+<section id="editor" class="view">
+  <header class="ed-head">
+    <h1>語音提詞器</h1>
+    <span class="ed-sub">跟著你的聲音走・說錯也不怕・字靠近鏡頭</span>
+    <div class="spacer"></div>
+    <button id="btnStart" class="primary">開始提詞 ▶</button>
+  </header>
+
+  <div class="ed-body">
+    <div class="ed-main">
+      <textarea id="script" spellcheck="false" placeholder="把稿子貼在這裡…&#10;&#10;# 開頭寫井號的一行＝章節標題（不用念，可一鍵跳轉）"></textarea>
+      <div class="ed-foot">
+        <span id="stats"></span>
+        <span class="hint">提示：用 <code># 標題</code> 分章節；游標放在哪裡，就從哪裡開始提詞。</span>
+      </div>
+    </div>
+
+    <aside class="ed-side">
+      <h2>模式</h2>
+      <div class="seg" id="modeSeg">
+        <button data-v="voice">🎙 語音追蹤</button>
+        <button data-v="fixed">⏱ 固定速度</button>
+      </div>
+
+      <label>辨識語言
+        <select id="lang">
+          <option value="auto">自動偵測</option>
+          <option value="zh-TW">中文（台灣／繁體）</option>
+          <option value="zh-CN">中文（普通話／簡體）</option>
+          <option value="yue-Hant-HK">粵語（香港）</option>
+          <option value="en-US">English (US)</option>
+          <option value="ja-JP">日本語</option>
+          <option value="ko-KR">한국어</option>
+        </select>
+      </label>
+
+      <h2>外觀</h2>
+      <label>字體大小 <output id="fontSizeOut"></output>
+        <input type="range" id="fontSize" min="24" max="120" step="2">
+      </label>
+      <label>行距 <output id="lineHeightOut"></output>
+        <input type="range" id="lineHeight" min="1.2" max="2.2" step="0.1">
+      </label>
+      <label>文字寬度 <output id="widthOut"></output>
+        <input type="range" id="width" min="30" max="100" step="5">
+      </label>
+      <label>提詞區高度（靠近鏡頭） <output id="bandSizeOut"></output>
+        <input type="range" id="bandSize" min="20" max="100" step="5">
+      </label>
+      <label>固定速度 <output id="speedOut"></output>
+        <input type="range" id="speed" min="10" max="300" step="5">
+      </label>
+
+      <h2>其他</h2>
+      <label class="chk"><input type="checkbox" id="camera"> 顯示鏡頭預覽（可錄影）</label>
+      <label class="chk"><input type="checkbox" id="mirror"> 鏡像翻轉（外接硬體提詞器用）</label>
+      <label class="chk"><input type="checkbox" id="showHeard" > 顯示辨識到的文字</label>
+
+      <div id="srWarn" class="warn" hidden>
+        這個瀏覽器不支援語音辨識。請改用 <b>Chrome</b> 或 <b>Edge</b>（電腦或 Android），或 iPhone 的 Safari。固定速度模式仍可使用。
+      </div>
+
+      <details class="keys">
+        <summary>快捷鍵</summary>
+        <ul>
+          <li><kbd>空白</kbd> 開始／暫停</li>
+          <li><kbd>↑</kbd><kbd>↓</kbd> 上一行／下一行</li>
+          <li><kbd>←</kbd><kbd>→</kbd> 調整固定速度</li>
+          <li><kbd>+</kbd><kbd>-</kbd> 字體大小</li>
+          <li><kbd>Home</kbd> 回到開頭</li>
+          <li><kbd>Esc</kbd> 或 長按畫面：回到編輯</li>
+          <li>點任一字：從那裡開始追蹤</li>
+        </ul>
+      </details>
+    </aside>
+  </div>
+</section>
+
+<!-- ============ 提詞頁 ============ -->
+<section id="prompter" class="view" hidden>
+  <video id="cam" playsinline muted autoplay hidden></video>
+
+  <div id="band">
+    <div id="track"></div>
+    <div id="marker"></div>
+  </div>
+
+  <div id="heard" hidden></div>
+
+  <div id="bar">
+    <button id="btnPlay" class="big" title="開始／暫停（空白鍵）">▶</button>
+    <span id="status" class="status"></span>
+    <div class="seg small" id="modeSeg2">
+      <button data-v="voice" title="語音追蹤">🎙</button>
+      <button data-v="fixed" title="固定速度">⏱</button>
+    </div>
+    <span id="speedCtl" class="grp">
+      <button data-act="slower">−</button><span id="speedLabel"></span><button data-act="faster">＋</button>
+    </span>
+    <span class="grp">
+      <button data-act="smaller" title="字變小">A−</button><button data-act="bigger" title="字變大">A＋</button>
+    </span>
+    <div id="chapters"></div>
+    <div class="spacer"></div>
+    <button id="btnCam" title="鏡頭預覽">📷</button>
+    <button id="btnRec" title="錄影" hidden>⏺</button>
+    <span id="recTime" hidden></span>
+    <button id="btnEdit" title="編輯稿子（或長按畫面）">✎</button>
+  </div>
+</section>
+
+<div id="toast" hidden></div>
+
+<script src="tracker.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
