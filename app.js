@@ -250,22 +250,48 @@
     lastProgress = performance.now();
   }
 
-  function startListening() {
-    if (!SR) { toast('這個瀏覽器不支援語音辨識，請用 Chrome 或 Edge。'); return false; }
-    if (!tokens.length) { toast('稿子是空的'); return false; }
-    rec = new SR();
-    rec.lang = recogLang();
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.maxAlternatives = 1;
+  // Chrome 的連續辨識會不定時自己斷線，偶爾還會卡住（不回結果也不觸發 onend）。
+  // 所以：每次重啟都建立全新的辨識實例、快速失敗時逐步拉長重試間隔、
+  // 並用看門狗偵測「卡住」，自動換一條新連線。
+  let recGen = 0;          // 每條連線的編號，舊連線的事件一律忽略
+  let lastRecEvent = 0;    // 最後一次收到任何辨識事件的時間
+  let sessionStart = 0;
+  let restartDelay = 250;
+  let restartT, watchdogT;
+  let everStarted = false; // 這次播放中是否成功開始過
 
-    rec.onresult = e => {
-      let interim = '';
+  const WATCHDOG_MS = 12000;   // 超過這麼久沒有任何事件 → 視為卡住
+  const MAX_SESSION_MS = 45000; // 單條連線用太久 → 趁句子結束時換新的
+
+  function createRec() {
+    const gen = ++recGen;
+    const r = new SR();
+    r.lang = recogLang();
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+
+    const alive = () => gen === recGen && listening;
+    const touch = () => { if (alive()) lastRecEvent = performance.now(); };
+
+    r.onaudiostart = r.onsoundstart = r.onspeechstart = touch;
+    r.onstart = () => {
+      if (!alive()) return;
+      touch();
+      everStarted = true;
+      setStatus('listening');
+    };
+
+    r.onresult = e => {
+      if (!alive()) return;
+      touch();
+      let interim = '', gotFinal = false;
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i], txt = r[0].transcript;
-        if (r.isFinal) {
+        const res = e.results[i], txt = res[0].transcript;
+        if (res.isFinal) {
           heardFinal.push(...Tracker.tokenize(txt));
           heardText = (heardText + txt).slice(-80);
+          gotFinal = true;
         } else interim += txt;
       }
       if (heardFinal.length > 80) heardFinal = heardFinal.slice(-QLEN * 2);
@@ -275,41 +301,103 @@
       clearTimeout(hearT);
       hearT = setTimeout(() => listening && setStatus('listening'), 700);
       onSpeech(q);
+      // 連線太久，瀏覽器內部累積的結果會越來越多，趁一句話剛結束時換新連線
+      if (gotFinal && !interim && performance.now() - sessionStart > MAX_SESSION_MS) recycle();
     };
 
-    rec.onerror = e => {
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
-        stopListening();
-        setStatus('error', '無麥克風權限');
-        toast('麥克風權限被拒絕。請點網址列左側的圖示允許麥克風，然後再按一次 ▶。');
-      } else if (e.error === 'network') {
-        setStatus('error', '網路錯誤');
-        toast('語音辨識需要網路（Chrome／Edge 的辨識服務在雲端）。');
-      } else if (e.error === 'language-not-supported') {
-        stopListening();
-        toast('這個瀏覽器不支援「' + rec.lang + '」的語音辨識。');
+    r.onerror = e => {
+      if (!alive()) return;
+      touch();
+      switch (e.error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          if (everStarted) {
+            // 用到一半被瀏覽器擋下自動重啟（常見於 Safari），需要使用者再點一次
+            pauseWith('已中斷，點 ▶ 繼續');
+          } else {
+            pauseWith('無麥克風權限');
+            toast('麥克風權限被拒絕。請點網址列左側的圖示允許麥克風，然後再按一次 ▶。');
+          }
+          break;
+        case 'language-not-supported':
+          pauseWith('不支援此語言');
+          toast('這個瀏覽器不支援「' + r.lang + '」的語音辨識。');
+          break;
+        case 'audio-capture':
+          setStatus('error', '麥克風被佔用');
+          toast('抓不到麥克風。如果開著鏡頭預覽，有些手機無法同時錄影又辨識，可以先關掉 📷 試試。');
+          break;
+        case 'network':
+          setStatus('error', '重新連線中…');
+          break;
+        // no-speech / aborted：正常現象，onend 會自動重啟
       }
-      // no-speech / aborted：onend 會自動重啟
     };
 
-    // Chrome 大約每隔一段時間會自己結束，持續重啟
-    rec.onend = () => {
-      if (!listening) return;
-      setTimeout(() => { if (listening) try { rec.start(); } catch {} }, 120);
+    r.onend = () => {
+      if (!alive()) return;
+      // 連線很快就結束 → 可能在出錯，拉長重試間隔；正常結束 → 馬上重啟
+      const lived = performance.now() - sessionStart;
+      restartDelay = lived < 1500 ? Math.min(restartDelay * 2, 5000) : 250;
+      scheduleRestart();
     };
 
-    try { rec.start(); } catch (err) { toast('無法啟動語音辨識：' + err.message); return false; }
+    rec = r;
+    sessionStart = lastRecEvent = performance.now();
+    try { r.start(); }
+    catch { restartDelay = Math.min(restartDelay * 2, 5000); scheduleRestart(); }
+  }
+
+  function scheduleRestart() {
+    clearTimeout(restartT);
+    restartT = setTimeout(() => {
+      // 分頁在背景時瀏覽器不給辨識，等切回來再由 visibilitychange 重啟
+      if (listening && !document.hidden) createRec();
+    }, restartDelay);
+  }
+
+  // 丟掉目前的連線，換一條新的
+  function recycle() {
+    const old = rec;
+    recGen++;           // 讓舊連線之後的事件全部失效
+    rec = null;
+    if (old) { try { old.abort(); } catch {} }
+    restartDelay = 250;
+    scheduleRestart();
+  }
+
+  function startListening() {
+    if (!SR) { toast('這個瀏覽器不支援語音辨識，請用 Chrome 或 Edge。'); return false; }
+    if (!tokens.length) { toast('稿子是空的'); return false; }
     listening = true;
+    everStarted = false;
+    restartDelay = 250;
     lastProgress = performance.now();
     heardFinal = [];
-    setStatus('listening');
+    heardText = '';
+    setStatus('listening', '啟動中…');
+    createRec();
+    clearInterval(watchdogT);
+    watchdogT = setInterval(() => {
+      if (!listening || document.hidden) return;
+      if (performance.now() - lastRecEvent > WATCHDOG_MS) recycle();
+    }, 2000);
     return true;
   }
 
   function stopListening() {
     listening = false;
+    recGen++;
+    clearTimeout(restartT);
+    clearInterval(watchdogT);
     if (rec) { try { rec.abort(); } catch {} rec = null; }
     setStatus('');
+  }
+
+  // 無法自動恢復的情況：停下來並告訴使用者原因
+  function pauseWith(msg) {
+    setPlaying(false);
+    setStatus('error', msg);
   }
 
   // ================= 播放控制 =================
@@ -621,10 +709,11 @@
   });
 
   document.addEventListener('visibilitychange', async () => {
-    // 切回分頁時螢幕常亮鎖會被系統釋放，重新取得
-    if (!document.hidden && !prompter.hidden) {
-      try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
-    }
+    if (document.hidden || prompter.hidden) return;
+    // 切回分頁：瀏覽器在背景時會中斷辨識，換一條新連線
+    if (listening) recycle();
+    // 螢幕常亮鎖也會被系統釋放，重新取得
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   });
 
   // 初始化
