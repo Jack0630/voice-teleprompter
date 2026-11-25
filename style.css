@@ -243,3 +243,8 @@ kbd { background: var(--panel); border: 1px solid var(--line); border-radius: 4p
   #heard { bottom: calc(70px + env(safe-area-inset-bottom, 0px)); }
   #band { left: env(safe-area-inset-left, 0px); right: env(safe-area-inset-right, 0px); }
 }
+
+/* ---------- 錄影完成 ---------- */
+.save-box { width: min(480px, 100%); }
+#savePreview { width: 100%; max-height: 50vh; background: #000; border-radius: 8px; }
+.save-box .modal-actions button { min-height: 44px; }

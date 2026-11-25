@@ -148,6 +148,21 @@
   </div>
 </div>
 
+<!-- ============ 錄影完成（手機：存到相簿／分享） ============ -->
+<div id="saveDlg" class="modal" hidden>
+  <div class="modal-box save-box" role="dialog" aria-labelledby="saveTitle">
+    <h2 id="saveTitle">🎬 錄影完成</h2>
+    <video id="savePreview" playsinline controls muted></video>
+    <p class="muted" id="saveInfo"></p>
+    <div class="modal-actions">
+      <button id="saveShare" class="primary">儲存影片／分享</button>
+      <button id="saveDownload">⬇ 下載檔案</button>
+      <span class="spacer"></span>
+      <button id="saveClose">關閉</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" hidden></div>
 
 <script src="tracker.js"></script>

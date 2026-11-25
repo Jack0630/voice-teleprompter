@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.4.1';
+  const APP_VERSION = '1.4.2';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -729,12 +729,8 @@
       const blob = new Blob(chunks, { type: recorder.mimeType });
       const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
       const d = new Date(), p = n => String(n).padStart(2, '0');
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `提詞錄影_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-      toast('錄影已下載');
+      const name = `提詞錄影_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+      handleRecording(blob, name);
     };
     recorder.start(1000);
     recStart = Date.now();
@@ -745,6 +741,79 @@
       recTime.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     }, 250);
   }
+
+  // ---------- 錄影完成：手機跳出分享選單（可「儲存影片」到相簿），電腦直接下載 ----------
+  const TOUCH = matchMedia('(hover: none) and (pointer: coarse)').matches;
+  const saveDlg = $('#saveDlg'), savePreview = $('#savePreview');
+  let lastRec = null; // { blob, file, name, url, saved }
+
+  function downloadBlob(blob, name) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  }
+
+  function canShareFile(file) {
+    try { return !!(navigator.canShare && navigator.canShare({ files: [file] })); } catch { return false; }
+  }
+
+  function handleRecording(blob, name) {
+    const file = new File([blob], name, { type: blob.type });
+    if (!TOUCH || !canShareFile(file)) {
+      downloadBlob(blob, name);
+      toast('錄影已下載');
+      return;
+    }
+    lastRec = { blob, file, name, url: URL.createObjectURL(blob), saved: false };
+    // 剛按下停止的那一刻還算「使用者操作」，有機會直接跳出分享選單；
+    // 被瀏覽器擋下（或使用者取消）就改開「錄影完成」視窗，再點一下按鈕分享
+    navigator.share({ files: [file] })
+      .then(() => { Report.log('cam', '錄影已透過分享選單儲存'); lastRec.saved = true; toast('影片已儲存'); discardRec(); })
+      .catch(err => { Report.log('cam', `直接分享未完成（${err.name}），改開錄影完成視窗`); openSaveDlg(); });
+  }
+
+  function openSaveDlg() {
+    if (!lastRec) return;
+    const mb = (lastRec.blob.size / 1048576).toFixed(1);
+    $('#saveInfo').textContent = `${lastRec.name}（${mb} MB）。按「儲存影片／分享」後，在選單裡選「儲存影片」就會存進相簿。`;
+    savePreview.src = lastRec.url;
+    saveDlg.hidden = false;
+  }
+
+  function discardRec() {
+    if (!lastRec) return;
+    savePreview.removeAttribute('src');
+    savePreview.load();
+    const url = lastRec.url;
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    lastRec = null;
+  }
+
+  function closeSaveDlg() {
+    if (lastRec && !lastRec.saved && !confirm('影片還沒儲存，關掉就沒有了。確定要關閉嗎？')) return;
+    saveDlg.hidden = true;
+    discardRec();
+  }
+
+  $('#saveShare').onclick = () => {
+    if (!lastRec) return;
+    navigator.share({ files: [lastRec.file] })
+      .then(() => { Report.log('cam', '錄影已透過分享選單儲存'); if (lastRec) lastRec.saved = true; toast('影片已儲存'); })
+      .catch(err => {
+        if (err.name === 'AbortError') return; // 使用者自己取消
+        Report.log('cam', `分享失敗：${err.name} ${err.message}`, 'warn');
+        toast('無法開啟分享選單，請改按「下載檔案」');
+      });
+  };
+  $('#saveDownload').onclick = () => {
+    if (!lastRec) return;
+    downloadBlob(lastRec.blob, lastRec.name);
+    lastRec.saved = true;
+    toast('已開始下載');
+  };
+  $('#saveClose').onclick = closeSaveDlg;
 
   function stopRecording() {
     if (recorder && recorder.state !== 'inactive') recorder.stop();
@@ -869,6 +938,10 @@
 
   // ================= 鍵盤 =================
   document.addEventListener('keydown', e => {
+    if (!saveDlg.hidden) {
+      if (e.key === 'Escape') closeSaveDlg();
+      return;
+    }
     if (!reportDlg.hidden) {
       if (e.key === 'Escape') closeReport();
       return; // 回報視窗開著時，不觸發提詞器的快捷鍵
