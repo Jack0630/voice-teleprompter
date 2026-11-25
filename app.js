@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.4.2';
+  const APP_VERSION = '1.4.3';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -720,19 +720,25 @@
     if (!camStream || !window.MediaRecorder) return;
     const type = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm']
       .find(t => MediaRecorder.isTypeSupported(t)) || '';
-    recorder = new MediaRecorder(camStream, type ? { mimeType: type, videoBitsPerSecond: 8e6 } : undefined);
-    chunks = [];
-    recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
-    recorder.onerror = e => Report.log('cam', '錄影錯誤：' + (e.error ? e.error.message : '未知'), 'error');
+    // 用這次錄影自己的變數：按下停止後 recorder 會馬上清成 null，
+    // 但 onstop 要等一下才觸發，不能再去讀 recorder
+    const mr = new MediaRecorder(camStream, type ? { mimeType: type, videoBitsPerSecond: 8e6 } : undefined);
+    const parts = [];
+    recorder = mr;
+    chunks = parts;
+    mr.ondataavailable = e => e.data.size && parts.push(e.data);
+    mr.onerror = e => Report.log('cam', '錄影錯誤：' + (e.error ? e.error.message : '未知'), 'error');
     Report.log('cam', '開始錄影（' + (type || '瀏覽器預設格式') + '）');
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: recorder.mimeType });
+    mr.onstop = () => {
+      if (!parts.length) { Report.log('cam', '錄影沒有任何資料', 'warn'); toast('錄影失敗：沒有錄到任何畫面'); return; }
+      const blob = new Blob(parts, { type: mr.mimeType || type || 'video/mp4' });
+      Report.log('cam', `錄影結束（${(blob.size / 1048576).toFixed(1)} MB）`);
       const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
       const d = new Date(), p = n => String(n).padStart(2, '0');
       const name = `提詞錄影_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
       handleRecording(blob, name);
     };
-    recorder.start(1000);
+    mr.start(1000);
     recStart = Date.now();
     btnRec.classList.add('on');
     recTime.hidden = false;
