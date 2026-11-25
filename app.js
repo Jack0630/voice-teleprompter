@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.4.0';
+  const APP_VERSION = '1.4.1';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -330,6 +330,17 @@
   // ---------- 麥克風音量偵測 ----------
   // Android 上同時開兩個麥克風來源會讓辨識失效，所以手機上不啟用，只靠看門狗
   const VAD_OK = !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+  // iPhone／iPad（所有瀏覽器底層都是 Safari）與電腦版 Safari 的語音辨識跟 Chrome 不同：
+  // 沒有 Chrome 說話 22 秒就卡住的問題，反而是自動開新連線後常常「開始了卻收不到任何結果」。
+  // 所以在這些瀏覽器上：不做例行換線、不因為安靜太久就換線；真的斷了才重開，
+  // 重開後沒反應就提示使用者點一下畫面（由手勢觸發的 start() 在 iOS 上最可靠）。
+  const UA = navigator.userAgent;
+  const APPLE_SR = /iPhone|iPad|iPod/i.test(UA)
+    || (/Macintosh/.test(UA) && navigator.maxTouchPoints > 1)
+    || (/Safari\//.test(UA) && !/Chrome|Chromium|Edg|OPR|Android/.test(UA));
+  const APPLE_HINT_MS = 6000;    // Safari：這麼久沒有辨識結果 → 提示點畫面重新收音
+  let appleHint = false;
   let vad = null;           // { ctx, stream, analyser, buf }
   let noiseFloor = 0.01;
   let speakingMs = 0;       // 上次有辨識結果之後，累積偵測到的說話時間
@@ -395,6 +406,7 @@
       touch();
       lastResult = performance.now();
       speakingMs = 0;
+      appleHint = false;
       restartDelay = 150;
       let interim = '', finalText = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -424,7 +436,7 @@
         dbg(`#${gen} 聽到「${shown}」→ ${outcome}` + (lost ? `｜稿子此處「${scriptAround(cursor)}」` : ''));
       }
       // 一句話剛說完是換線的好時機
-      if (gotFinal && !interim && performance.now() - sessionStart > ROTATE_AFTER_MS) rotate('句子結束');
+      if (!APPLE_SR && gotFinal && !interim && performance.now() - sessionStart > ROTATE_AFTER_MS) rotate('句子結束');
     };
 
     r.onerror = e => {
@@ -469,6 +481,8 @@
       clearTimeout(rotateT);
       // 例行換線 → 立刻開新的；連線很快就結束 → 可能在出錯，拉長重試間隔；其他 → 馬上重啟
       restartDelay = wasRotating ? 0 : lived < 1500 ? Math.min(restartDelay * 2, MAX_BACKOFF_MS) : 150;
+      // Safari：前一條連線的麥克風要一點時間才放開，馬上重開容易收不到聲音
+      if (APPLE_SR) restartDelay = Math.max(restartDelay, 500);
       dbg(`#${gen} 結束（${(lived / 1000).toFixed(1)}s${wasRotating ? '，例行換線' : ''}），${restartDelay}ms 後重啟`);
       scheduleRestart();
     };
@@ -476,6 +490,7 @@
     rec = r;
     sessionStart = lastRecEvent = lastResult = performance.now();
     speakingMs = 0;
+    appleHint = false;
     dbg(`#${gen} start()`);
     try { r.start(); }
     catch (err) {
@@ -548,6 +563,16 @@
     silentTicks = speaking ? 0 : silentTicks + 1;
     if (rotating) return; // 例行換線中，等它結束
 
+    // Safari：安靜時本來就不會有事件，不用看門狗換線（自動換線在 iOS 上反而會讓辨識失靈）；
+    // 只在太久沒有結果時提示使用者點一下畫面
+    if (APPLE_SR) {
+      if (!appleHint && now - lastResult > APPLE_HINT_MS) {
+        appleHint = true;
+        setStatus('error', '沒反應？點一下畫面');
+      }
+      return;
+    }
+
     // 聽到你在說話，辨識卻沒有回應 → 卡住了
     if (speaking) {
       speakingMs += TICK_MS;
@@ -564,6 +589,24 @@
     else if (age > ROTATE_FORCE_MS) rotate('時間到');
   }
 
+  // Safari：使用者點畫面時，在手勢當下直接開一條新連線（不經過 setTimeout，才算是使用者觸發）
+  function restartFromTap() {
+    if (!APPLE_SR || !listening) return;
+    if (performance.now() - lastResult < 3000) return; // 正在正常辨識，不要打斷
+    Report.count('點畫面重新收音');
+    dbg('點畫面重新收音');
+    keepInterim();
+    rotating = 0;
+    clearTimeout(rotateT);
+    clearTimeout(restartT);
+    const old = rec;
+    recGen++;
+    rec = null;
+    if (old) { old.onend = null; try { old.abort(); } catch {} }
+    appleHint = false;
+    createRec();
+  }
+
   function startListening() {
     if (!SR) { toast('這個瀏覽器不支援語音辨識，請用 Chrome 或 Edge。'); return false; }
     if (!tokens.length) { toast('稿子是空的'); return false; }
@@ -575,7 +618,8 @@
     heardText = '';
     interimTokens = [];
     setStatus('listening', '啟動中…');
-    dbg(`開始聆聽（語言 ${recogLang()}，音量偵測${VAD_OK ? '開啟' : '在手機上停用'}）`);
+    appleHint = false;
+    dbg(`開始聆聽（語言 ${recogLang()}，音量偵測${VAD_OK ? '開啟' : '在手機上停用'}${APPLE_SR ? '，Safari 模式：不例行換線' : ''}）`);
     createRec();
     startVAD();
     clearInterval(watchdogT);
@@ -778,6 +822,7 @@
   const endPress = () => {
     clearTimeout(pressT);
     if (down && !down.moved && !down.long) {
+      restartFromTap();
       const t = down.target.closest && down.target.closest('.tk');
       if (t) jumpTo(+t.dataset.i);
       else if (S.mode === 'fixed') setPlaying(!playing);
