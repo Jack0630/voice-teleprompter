@@ -3,6 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0f12">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="提詞器">
 <title>語音提詞器</title>
 <link rel="stylesheet" href="style.css">
 <script src="report.js"></script>
@@ -15,7 +20,8 @@
     <h1>語音提詞器</h1>
     <span class="ed-sub">跟著你的聲音走・說錯也不怕・字靠近鏡頭</span>
     <div class="spacer"></div>
-    <button class="report-btn" title="回報問題">🐞 回報問題<span class="badge" hidden></span></button>
+    <button class="report-btn" title="回報問題">🐞<span class="lbl"> 回報問題</span><span class="badge" hidden></span></button>
+    <button id="btnSettings" class="mobile-only" title="設定">⚙ 設定</button>
     <button id="btnStart" class="primary">開始提詞 ▶</button>
   </header>
 
@@ -24,7 +30,7 @@
       <textarea id="script" spellcheck="false" placeholder="把稿子貼在這裡…&#10;&#10;# 開頭寫井號的一行＝章節標題（不用念，可一鍵跳轉）"></textarea>
       <div class="ed-foot">
         <span id="stats"></span>
-        <span class="hint">提示：用 <code># 標題</code> 分章節；游標放在哪裡，就從哪裡開始提詞。</span>
+        <span class="hint">提示：用 <code># 標題</code> 分章節；游標放在哪裡，就從哪裡開始提詞。<span class="touch-only">提詞時長按畫面可回到編輯。</span></span>
       </div>
     </div>
 

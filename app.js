@@ -22,7 +22,7 @@
 長按畫面任何地方，就可以回到編輯頁修改稿子。
 開錄之前，記得先對著提詞器把稿子完整念一遍，把繞口的地方全部改順。`;
 
-  const APP_VERSION = '1.3.2';
+  const APP_VERSION = '1.4.0';
   const SETTINGS_VERSION = 2;
   const DEFAULTS = {
     script: SAMPLE, mode: 'voice', lang: 'zh-TW',
@@ -38,7 +38,10 @@
     // 舊版預設是「自動偵測」，升級時改成中文（台灣）；之後使用者自己選的就不動
     if ((saved.v || 1) < 2 && saved.lang === 'auto') saved.lang = 'zh-TW';
     saved.v = SETTINGS_VERSION;
-    return Object.assign({}, DEFAULTS, saved);
+    // 手機（窄螢幕）第一次使用：字小一點、寬度撐滿，避免一行只剩幾個字
+    const phone = Math.min(screen.width, screen.height) < 600;
+    const base = phone ? Object.assign({}, DEFAULTS, { fontSize: 34, width: 92, bandSize: 50 }) : DEFAULTS;
+    return Object.assign({}, base, saved);
   }
   let saveT;
   function save() {
@@ -801,6 +804,16 @@
     }
   }
 
+  // 手機沒有滑鼠移過去的動作：控制列變淡時，第一下點擊只用來叫醒它，不觸發按鈕
+  let swallowClick = false;
+  bar.addEventListener('pointerdown', e => {
+    swallowClick = e.pointerType !== 'mouse' && bar.classList.contains('dim');
+    poke();
+  });
+  bar.addEventListener('click', e => {
+    if (swallowClick) { swallowClick = false; e.stopPropagation(); e.preventDefault(); }
+  }, true);
+
   // 播放中控制列自動變淡，避免分心
   let dimT;
   function poke() {
@@ -1025,6 +1038,14 @@
     clearTimeout(toastT);
     toastT = setTimeout(() => (t.hidden = true), 3500);
   }
+
+  // 手機上「顯示／隱藏設定」
+  $('#btnSettings').onclick = () => {
+    const side = $('.ed-side');
+    side.classList.toggle('open');
+    $('#btnSettings').classList.toggle('on', side.classList.contains('open'));
+    if (side.classList.contains('open')) side.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
 
   window.addEventListener('resize', () => {
     if (prompter.hidden) return;
